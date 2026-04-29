@@ -1,0 +1,806 @@
+---
+title: "l1_turning_point_0.3"
+output: html_document
+date: "2026-04-04"
+---
+
+```{r}
+
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/rESEM-l1.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/rESEMl1-unshrink.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/IS-lasso.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/generation_function.R")
+
+library(MASS); library(lavaan); library(lslx)
+
+# Helper Function 1: build_lslx_model
+
+build_lslx_model <- function(J, n_factors = 3) {
+  J_per_factor <- J / n_factors
+  lines <- c()
+   # Step 1: Write main loadings
+  for (k in 1:n_factors) {
+    main_items <- paste0("x", ((k-1)*J_per_factor + 1):(k*J_per_factor))
+    lines <- c(lines, paste0("f", k, " :=> ", paste(main_items, collapse = " + ")))
+  }
+  # Step 2: Write cross-loadings (loadings on items from other factors, penalized by LASSO)
+  for (k in 1:n_factors) {
+    other_items <- paste0("x", setdiff(1:J, ((k-1)*J_per_factor + 1):(k*J_per_factor)))
+    lines <- c(lines, paste0("f", k, " :~> ", paste(other_items, collapse = " + ")))
+  }
+   # Step 3: Fix each factor's variance to 1
+  for (k in 1:n_factors) {
+    lines <- c(lines, paste0("f", k, " <=> fix(1) * f", k))
+  }
+  paste(lines, collapse = "\n")
+}
+
+# Helper Function 2: run_lslx
+
+# Purpose: Run lslx on one dataset, return the estimated loading matrix
+run_lslx <- function(X, J, n_factors = 3) {
+  X_df <- as.data.frame(X); colnames(X_df) <- paste0("x", 1:J)
+  model <- build_lslx_model(J = J, n_factors = n_factors)
+  lambda_grid <- if (J >= 36) c(0.00, 0.10) else seq(0.00, 0.10, 0.05)# Set lambda grid (range of penalty values to try)\\Fewer values when J is large, to save time
+  result <- tryCatch({
+    fit <- plsem(model = model, data = X_df,
+                 penalty_method = "lasso", lambda_grid = lambda_grid)#  Search these lambda values
+    list(converged = TRUE,
+         loadings = fit$extract_coefficient_matrix(selector="bic", block="y<-f")$g) # Use BIC criterion to select best lambda, extract loading matrix
+  }, error = function(e) list(converged = FALSE, loadings = NULL))
+  return(result)
+}
+
+# Purpose: Factor analysis has "permutation ambiguity" and "sign ambiguity"
+#          e.g., true order is [f1,f2,f3] but estimated might be [f3,f1,f2],
+#          or f1's signs are all flipped. This function aligns them before computing MSE.
+
+align_loadings <- function(Lambda_est, Lambda_true) {
+  n_factors <- ncol(Lambda_true)
+  
+  cor_mat <- matrix(NA, n_factors, n_factors) # Step 1: Compute absolute correlation between every pair of estimated vs true factors
+  for (i in 1:n_factors)
+    for (j in 1:n_factors)
+      cor_mat[i, j] <- abs(cor(Lambda_est[, i], Lambda_true[, j]))
+  
+  # Step 2: Greedy matching — find best permutation of factors
+  order_est <- rep(NA, n_factors); used <- rep(FALSE, n_factors)# Track which estimated factors are matched
+  
+  for (j in 1:n_factors) {  # Find the estimated factor most correlated with true factor j, not yet used
+    best_i <- which.max(cor_mat[, j] * (!used))
+    order_est[j] <- best_i; used[best_i] <- TRUE
+  }
+   # Reorder estimated loading matrix according to best permutation
+  Lambda_aligned <- Lambda_est[, order_est]
+  
+   # Step 3: Fix signs — if direction is flipped, multiply by -1
+  for (j in 1:n_factors)
+    if (cor(Lambda_aligned[, j], Lambda_true[, j]) < 0)
+      Lambda_aligned[, j] <- -Lambda_aligned[, j]
+  colnames(Lambda_aligned) <- paste0("f", 1:n_factors)
+  return(Lambda_aligned)
+}
+
+#  Run LASSO-ESEM on one dataset, return estimated loading matrix
+run_approxESEM <- function(X, J, n_factors = 3, nstarts = 20, Lambda_true = NULL) {
+   # Standardize data first
+  #  makes each column mean=0, sd=1
+  X_scaled <- scale(as.matrix(X))
+  result <- tryCatch({
+    lam_max <- find_lambda_max(DATA    = X_scaled,
+                               R       = n_factors,
+                               MaxIter = 250,
+                               eps     = 1e-5,
+                               nstarts = 1,        #  1 start (for speed)
+                               verbose = FALSE)
+
+    lam_sel <- IS_strategy(X          = X_scaled,
+                           R          = n_factors,
+                           MaxIter    = 250,
+                           eps        = 1e-5,
+                           nstarts    = 1,          #  1 start (for speed)
+                           lambda_max = lam_max)
+
+    fit <- MULTISTART_rESEMl1(DATA    = X_scaled,
+                              R       = n_factors,
+                              lambda  = lam_sel,
+                              MaxIter = 1000,
+                              eps     = 1e-6,
+                              nstarts = nstarts)   # 20 
+
+    fit_us <- rESEMl1_undoshrinkage(DATA    = X_scaled,
+                                    R       = n_factors,
+                                    P       = fit$loadings,
+                                    MaxIter = 1000,
+                                    eps     = 1e-6)
+
+    lm <- fit_us$loadings
+    rownames(lm) <- paste0("x", 1:J)
+    colnames(lm) <- paste0("f", 1:n_factors)
+    if (!is.null(Lambda_true)) lm <- align_loadings(lm, Lambda_true)
+
+    list(converged = fit$converged, loadings = lm)
+  }, error = function(e) {
+    message("ESEM error: ", e$message)
+    list(converged = FALSE, loadings = NULL)
+  })
+  return(result)
+}
+
+
+# test：J = 15, 30, 45, 60，N = 300
+
+set.seed(42)
+N      <- 300
+J_test <- c(15, 30, 45, 60)
+
+
+timing_results <- data.frame(
+  J             = integer(),
+  lslx_time_sec = numeric(),
+  esem_time_sec = numeric(),
+  lslx_converged = logical(),
+  esem_converged  = logical(),
+  lslx_mse      = numeric(),
+  esem_mse      = numeric()
+)
+
+for (J in J_test) {
+  cat("▶ J =", J, "\n")
+
+  dgp <- data_generation(PL = 0.6, nvar.factor = J/3, nfactors = 3,
+                         reliability = 0.36, factor_corr = 0.3, N = N,
+                         beta = c(0.5, 0.3, 0.2), VAFy = 0.5, CL = FALSE)
+
+  cat("  running lslx  ... ")
+  t1 <- system.time({ r1 <- run_lslx(X = dgp$X, J = J) })
+  cat(round(t1["elapsed"], 2), "s\n")
+
+  cat("  running ESEM  ... ")
+  t2 <- system.time({ r2 <- run_approxESEM(X = dgp$X, J = J, Lambda_true = dgp$Ptrue) })
+  cat(round(t2["elapsed"], 2), "s\n")
+
+  mse1 <- if (r1$converged) round(mean((r1$loadings - dgp$Ptrue)^2), 4) else NA
+  mse2 <- if (r2$converged) round(mean((r2$loadings - dgp$Ptrue)^2), 4) else NA
+
+  cat("  lslx  | converged:", r1$converged, "| MSE:", mse1, "\n")
+  cat("  ESEM  | converged:", r2$converged, "| MSE:", mse2, "\n\n")
+
+  timing_results <- rbind(timing_results, data.frame(
+    J               = J,
+    lslx_time_sec   = round(t1["elapsed"], 2),
+    esem_time_sec   = round(t2["elapsed"], 2),
+    lslx_converged  = r1$converged,
+    esem_converged  = r2$converged,
+    lslx_mse        = mse1,
+    esem_mse        = mse2
+  ))
+}
+
+```
+
+```{r}
+print(timing_results, row.names = FALSE)
+```
+
+
+```{r}
+
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/rESEM-l1.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/rESEMl1-unshrink.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/IS-lasso.R")
+source("C:/Users/20231809/Desktop/study/Y3/Q3/BEP/set up/RegularizedESEM-main/RegularizedESEM-main/Functions/generation_function.R")
+
+library(MASS); library(lavaan); library(lslx)
+
+
+build_lslx_model <- function(J, n_factors = 3) {
+  J_per_factor <- J / n_factors
+  lines <- c()
+  for (k in 1:n_factors) {
+    main_items <- paste0("x", ((k-1)*J_per_factor + 1):(k*J_per_factor))
+    lines <- c(lines, paste0("f", k, " :=> ", paste(main_items, collapse = " + ")))
+  }
+  for (k in 1:n_factors) {
+    other_items <- paste0("x", setdiff(1:J, ((k-1)*J_per_factor + 1):(k*J_per_factor)))
+    lines <- c(lines, paste0("f", k, " :~> ", paste(other_items, collapse = " + ")))
+  }
+  for (k in 1:n_factors) {
+    lines <- c(lines, paste0("f", k, " <=> fix(1) * f", k))
+  }
+  paste(lines, collapse = "\n")
+}
+
+run_lslx <- function(X, J, n_factors = 3) {
+  X_df <- as.data.frame(X); colnames(X_df) <- paste0("x", 1:J)
+  model <- build_lslx_model(J = J, n_factors = n_factors)
+  lambda_grid <- if (J >= 36) c(0.00, 0.10) else seq(0.00, 0.10, 0.05)
+  result <- tryCatch({
+    fit <- plsem(model = model, data = X_df,
+                 penalty_method = "lasso", lambda_grid = lambda_grid)
+    list(converged = TRUE,
+         loadings = fit$extract_coefficient_matrix(selector="bic", block="y<-f")$g)
+  }, error = function(e) list(converged = FALSE, loadings = NULL))
+  return(result)
+}
+
+align_loadings <- function(Lambda_est, Lambda_true) {
+  n_factors <- ncol(Lambda_true)
+  cor_mat <- matrix(NA, n_factors, n_factors)
+  for (i in 1:n_factors)
+    for (j in 1:n_factors)
+      cor_mat[i, j] <- abs(cor(Lambda_est[, i], Lambda_true[, j]))
+  order_est <- rep(NA, n_factors); used <- rep(FALSE, n_factors)
+  for (j in 1:n_factors) {
+    best_i <- which.max(cor_mat[, j] * (!used))
+    order_est[j] <- best_i; used[best_i] <- TRUE
+  }
+  Lambda_aligned <- Lambda_est[, order_est]
+  for (j in 1:n_factors)
+    if (cor(Lambda_aligned[, j], Lambda_true[, j]) < 0)
+      Lambda_aligned[, j] <- -Lambda_aligned[, j]
+  colnames(Lambda_aligned) <- paste0("f", 1:n_factors)
+  return(Lambda_aligned)
+}
+
+run_approxESEM <- function(X, J, n_factors = 3, nstarts = 20, Lambda_true = NULL) {
+  X_scaled <- scale(as.matrix(X))
+  result <- tryCatch({
+    lam_max <- find_lambda_max(DATA    = X_scaled,
+                               R       = n_factors,
+                               MaxIter = 250,
+                               eps     = 1e-5,
+                               nstarts = 1,
+                               verbose = FALSE)
+
+    lam_sel <- IS_strategy(X          = X_scaled,
+                           R          = n_factors,
+                           MaxIter    = 250,
+                           eps        = 1e-5,
+                           nstarts    = 1,
+                           lambda_max = lam_max)
+
+    fit <- MULTISTART_rESEMl1(DATA    = X_scaled,
+                              R       = n_factors,
+                              lambda  = lam_sel,
+                              MaxIter = 1000,
+                              eps     = 1e-6,
+                              nstarts = nstarts)
+
+    fit_us <- rESEMl1_undoshrinkage(DATA    = X_scaled,
+                                    R       = n_factors,
+                                    P       = fit$loadings,
+                                    MaxIter = 1000,
+                                    eps     = 1e-6)
+
+    lm <- fit_us$loadings
+    rownames(lm) <- paste0("x", 1:J)
+    colnames(lm) <- paste0("f", 1:n_factors)
+    if (!is.null(Lambda_true)) lm <- align_loadings(lm, Lambda_true)
+
+    list(converged = fit$converged, loadings = lm)
+  }, error = function(e) {
+    message("ESEM error: ", e$message)
+    list(converged = FALSE, loadings = NULL)
+  })
+  return(result)
+}
+```
+
+
+```{r}
+
+# 50 replications：N = 300，J change
+
+set.seed(42)
+N      <- 300
+J_seq  <- seq(15, 45, by = 3)
+n_rep  <- 50
+
+cat("开始运行 N =", N, "，J =", paste(J_seq, collapse = ", "), "，各", n_rep, "次\n\n")
+
+plot_df <- data.frame(
+  J              = integer(),
+  lslx_mse_mean  = numeric(),
+  lslx_mse_sd    = numeric(),
+  esem_mse_mean  = numeric(),
+  esem_mse_sd    = numeric(),
+  lslx_time      = numeric(),
+  esem_time      = numeric(),
+  lslx_conv_rate = numeric()
+)
+
+for (J in J_seq) {
+  cat("▶ J =", J, "\n")
+
+  lslx_mse_vec  <- numeric(n_rep)
+  esem_mse_vec  <- numeric(n_rep)
+  lslx_time_vec <- numeric(n_rep)
+  esem_time_vec <- numeric(n_rep)
+  lslx_conv_vec <- logical(n_rep)
+
+  for (rep in 1:n_rep) {
+    dgp <- data_generation(PL = 0.6, nvar.factor = J/3, nfactors = 3,
+                           reliability = 0.36, factor_corr = 0.3, N = N,
+                           beta = c(0.5, 0.3, 0.2), VAFy = 0.5, CL = FALSE)
+
+    t1 <- system.time({ r1 <- run_lslx(X = dgp$X, J = J) })
+    t2 <- system.time({ r2 <- run_approxESEM(X = dgp$X, J = J, Lambda_true = dgp$Ptrue) })
+
+    lslx_conv_vec[rep] <- r1$converged
+    lslx_mse_vec[rep]  <- if (r1$converged) mean((r1$loadings - dgp$Ptrue)^2) else NA
+    esem_mse_vec[rep]  <- if (r2$converged) mean((r2$loadings - dgp$Ptrue)^2) else NA
+    lslx_time_vec[rep] <- t1["elapsed"]
+    esem_time_vec[rep] <- t2["elapsed"]
+  }
+
+  cat("   lslx coverage rate:", mean(lslx_conv_vec),
+      "| ave MSE:", round(mean(lslx_mse_vec, na.rm=TRUE), 4),
+      "| average runtime:", round(mean(lslx_time_vec), 2), "s\n")
+  cat("   ESEM average MSE:", round(mean(esem_mse_vec, na.rm=TRUE), 4),
+      "|  average runtime:", round(mean(esem_time_vec), 2), "s\n\n")
+
+  plot_df <- rbind(plot_df, data.frame(
+    J              = J,
+    lslx_mse_mean  = mean(lslx_mse_vec,  na.rm = TRUE),
+    lslx_mse_sd    = sd(lslx_mse_vec,    na.rm = TRUE),
+    esem_mse_mean  = mean(esem_mse_vec,  na.rm = TRUE),
+    esem_mse_sd    = sd(esem_mse_vec,    na.rm = TRUE),
+    lslx_time      = mean(lslx_time_vec),
+    esem_time      = mean(esem_time_vec),
+    lslx_conv_rate = mean(lslx_conv_vec)
+  ))
+}
+
+
+# plot：MSE + Runtime + Runtime Ratio
+
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+x <- plot_df$J
+
+#  MSE 
+ylim_mse <- range(c(plot_df$lslx_mse_mean + plot_df$lslx_mse_sd,
+                    plot_df$esem_mse_mean  + plot_df$esem_mse_sd,
+                    plot_df$lslx_mse_mean  - plot_df$lslx_mse_sd,
+                    plot_df$esem_mse_mean  - plot_df$esem_mse_sd),
+                  na.rm = TRUE)
+
+plot(x, plot_df$lslx_mse_mean,
+     type = "b", pch = 16, col = "#E63946", lwd = 2,
+     ylim = ylim_mse,
+     xlab = "J (Number of Items)", ylab = "MSE",
+     main = paste0("MSE vs J  (N=", N, ", ", n_rep, " reps)"),
+     xaxt = "n")
+axis(1, at = J_seq)
+polygon(c(x, rev(x)),
+        c(plot_df$lslx_mse_mean + plot_df$lslx_mse_sd,
+          rev(plot_df$lslx_mse_mean - plot_df$lslx_mse_sd)),
+        col = adjustcolor("#E63946", 0.15), border = NA)
+lines(x, plot_df$esem_mse_mean,
+      type = "b", pch = 17, col = "#457B9D", lwd = 2, lty = 2)
+polygon(c(x, rev(x)),
+        c(plot_df$esem_mse_mean + plot_df$esem_mse_sd,
+          rev(plot_df$esem_mse_mean - plot_df$esem_mse_sd)),
+        col = adjustcolor("#457B9D", 0.15), border = NA)
+legend("topleft", legend = c("lslx", "LASSO-ESEM"),
+       col = c("#E63946", "#457B9D"),
+       lwd = 2, pch = c(16, 17), lty = c(1, 2), bty = "n")
+
+#  Runtime 
+ylim_t <- range(c(plot_df$lslx_time, plot_df$esem_time), na.rm = TRUE)
+
+plot(x, plot_df$lslx_time,
+     type = "b", pch = 16, col = "#E63946", lwd = 2,
+     ylim = ylim_t,
+     xlab = "J (Number of Items)", ylab = "Elapsed time (sec)",
+     main = paste0("Mean Runtime vs J  (N=", N, ", ", n_rep, " reps)"),
+     xaxt = "n")
+axis(1, at = J_seq)
+lines(x, plot_df$esem_time,
+      type = "b", pch = 17, col = "#457B9D", lwd = 2, lty = 2)
+legend("topleft", legend = c("lslx", "LASSO-ESEM"),
+       col = c("#E63946", "#457B9D"),
+       lwd = 2, pch = c(16, 17), lty = c(1, 2), bty = "n")
+
+#  Runtime Ratio (lslx / LASSO-ESEM) ---
+ratio <- plot_df$lslx_time / plot_df$esem_time
+
+plot(x, ratio,
+     type = "b", pch = 18, col = "#2D6A4F", lwd = 2,
+     ylim = c(0, max(ratio, na.rm = TRUE) * 1.15),
+     xlab = "J (Number of Items)", ylab = "lslx time / LASSO-ESEM time",
+     main = paste0("Runtime Ratio vs J  (N=", N, ", ", n_rep, " reps)"),
+     xaxt = "n")
+axis(1, at = J_seq)
+abline(h = 1, lty = 2, col = "gray50")
+text(x, ratio, labels = round(ratio, 1),
+     pos = 3, cex = 0.75, col = "#2D6A4F")
+
+mtext(paste0("LASSO-ESEM vs lslx  |  N = ", N),
+      outer = TRUE, cex = 1.1, font = 2)
+
+par(mfrow = c(1, 1))
+
+cat("\data：\n")
+print(plot_df, row.names = FALSE, digits = 4)
+```
+
+```{r}
+
+# Turning Point ：J = 15, 18, ..., 30
+
+# 50 replications
+
+J_seq  <- seq(15, 30, by = 3)
+N_seq  <- seq(100, 600, by = 100)
+n_rep  <- 50
+
+cat(" Turning Point start\n")
+cat("J =", paste(J_seq, collapse=", "), "\n")
+cat("N =", paste(N_seq, collapse=", "), "\n")
+cat("replications =", n_rep, "\n\n")
+
+# save data
+tp_df <- data.frame(
+  J              = integer(),
+  N              = integer(),
+  JN_ratio       = numeric(),
+  lslx_mse_mean  = numeric(),
+  lslx_mse_sd    = numeric(),
+  esem_mse_mean  = numeric(),
+  esem_mse_sd    = numeric(),
+  lslx_time      = numeric(),
+  esem_time      = numeric(),
+  lslx_conv_rate = numeric()
+)
+
+for (J in J_seq) {
+  for (N in N_seq) {
+    cat("▶ J =", J, "| N =", N, "(J/N =", round(J/N, 3), ")\n")
+
+    lslx_mse_vec  <- numeric(n_rep)
+    esem_mse_vec  <- numeric(n_rep)
+    lslx_time_vec <- numeric(n_rep)
+    esem_time_vec <- numeric(n_rep)
+    lslx_conv_vec <- logical(n_rep)
+
+    for (rep in 1:n_rep) {
+      dgp <- data_generation(PL = 0.6, nvar.factor = J/3, nfactors = 3,
+                             reliability = 0.36, factor_corr = 0.3, N = N,
+                             beta = c(0.5, 0.3, 0.2), VAFy = 0.5, CL = FALSE)
+
+      t1 <- system.time({ r1 <- run_lslx(X = dgp$X, J = J) })
+      t2 <- system.time({ r2 <- run_approxESEM(X = dgp$X, J = J, Lambda_true = dgp$Ptrue) })
+
+      lslx_conv_vec[rep] <- r1$converged
+      lslx_mse_vec[rep]  <- if (r1$converged) mean((r1$loadings - dgp$Ptrue)^2) else NA
+      esem_mse_vec[rep]  <- if (r2$converged) mean((r2$loadings - dgp$Ptrue)^2) else NA
+      lslx_time_vec[rep] <- t1["elapsed"]
+      esem_time_vec[rep] <- t2["elapsed"]
+    }
+
+    cat("   lslx coverage rate:", round(mean(lslx_conv_vec), 3),
+        "| MSE:", round(mean(lslx_mse_vec, na.rm=TRUE), 4),
+        "| runtime:", round(mean(lslx_time_vec), 2), "s\n")
+    cat("   ESEM MSE:", round(mean(esem_mse_vec, na.rm=TRUE), 4),
+        "| runtime:", round(mean(esem_time_vec), 2), "s\n\n")
+
+    tp_df <- rbind(tp_df, data.frame(
+      J              = J,
+      N              = N,
+      JN_ratio       = J / N,
+      lslx_mse_mean  = mean(lslx_mse_vec,  na.rm = TRUE),
+      lslx_mse_sd    = sd(lslx_mse_vec,    na.rm = TRUE),
+      esem_mse_mean  = mean(esem_mse_vec,  na.rm = TRUE),
+      esem_mse_sd    = sd(esem_mse_vec,    na.rm = TRUE),
+      lslx_time      = mean(lslx_time_vec),
+      esem_time      = mean(esem_time_vec),
+      lslx_conv_rate = mean(lslx_conv_vec)
+    ))
+  }
+}
+
+#visulization 
+cols   <- c("#E63946","#F4A261","#2A9D8F","#457B9D","#6A4C93","#2D6A4F")
+J_cols <- setNames(cols[1:length(J_seq)], as.character(J_seq))
+
+par(mfrow = c(2, 2), mar = c(4, 4, 3, 1), oma = c(0, 0, 2, 0))
+
+# lslx MSE vs N，
+ylim_lslx <- range(c(tp_df$lslx_mse_mean + tp_df$lslx_mse_sd,
+                     tp_df$lslx_mse_mean - tp_df$lslx_mse_sd), na.rm=TRUE)
+plot(NULL, xlim = range(N_seq), ylim = ylim_lslx,
+     xlab = "N", ylab = "MSE", main = "lslx MSE vs N",
+     xaxt = "n")
+axis(1, at = N_seq)
+for (j in J_seq) {
+  sub <- tp_df[tp_df$J == j, ]
+  lines(sub$N, sub$lslx_mse_mean, type="b", pch=16,
+        col=J_cols[as.character(j)], lwd=2)
+  polygon(c(sub$N, rev(sub$N)),
+          c(sub$lslx_mse_mean + sub$lslx_mse_sd,
+            rev(sub$lslx_mse_mean - sub$lslx_mse_sd)),
+          col=adjustcolor(J_cols[as.character(j)], 0.12), border=NA)
+}
+legend("topright", legend=paste0("J=",J_seq),
+       col=J_cols, lwd=2, pch=16, bty="n", cex=0.8)
+
+#  ESEM MSE vs N 
+ylim_esem <- range(c(tp_df$esem_mse_mean + tp_df$esem_mse_sd,
+                     tp_df$esem_mse_mean - tp_df$esem_mse_sd), na.rm=TRUE)
+plot(NULL, xlim = range(N_seq), ylim = ylim_esem,
+     xlab = "N", ylab = "MSE", main = "LASSO-ESEM MSE vs N",
+     xaxt = "n")
+axis(1, at = N_seq)
+for (j in J_seq) {
+  sub <- tp_df[tp_df$J == j, ]
+  lines(sub$N, sub$esem_mse_mean, type="b", pch=17,
+        col=J_cols[as.character(j)], lwd=2, lty=2)
+  polygon(c(sub$N, rev(sub$N)),
+          c(sub$esem_mse_mean + sub$esem_mse_sd,
+            rev(sub$esem_mse_mean - sub$esem_mse_sd)),
+          col=adjustcolor(J_cols[as.character(j)], 0.12), border=NA)
+}
+legend("topright", legend=paste0("J=",J_seq),
+       col=J_cols, lwd=2, pch=17, lty=2, bty="n", cex=0.8)
+
+#  Runtime vs N 
+ylim_t <- range(c(tp_df$lslx_time, tp_df$esem_time), na.rm=TRUE)
+plot(NULL, xlim = range(N_seq), ylim = ylim_t,
+     xlab = "N", ylab = "Elapsed time (sec)", main = "Mean Runtime vs N",
+     xaxt = "n")
+axis(1, at = N_seq)
+for (j in J_seq) {
+  sub <- tp_df[tp_df$J == j, ]
+  lines(sub$N, sub$lslx_time, type="b", pch=16,
+        col=J_cols[as.character(j)], lwd=2)
+  lines(sub$N, sub$esem_time, type="b", pch=17,
+        col=J_cols[as.character(j)], lwd=2, lty=2)
+}
+legend("topleft",
+       legend=c(paste0("lslx J=",J_seq[1]), paste0("ESEM J=",J_seq[1]),
+                "... (same colors per J)"),
+       col=c(J_cols[1], J_cols[1], NA),
+       lwd=2, pch=c(16,17,NA), lty=c(1,2,NA), bty="n", cex=0.75)
+
+#  Runtime Ratio vs N 
+tp_df$ratio <- tp_df$lslx_time / tp_df$esem_time
+ylim_r <- range(tp_df$ratio, na.rm=TRUE)
+plot(NULL, xlim = range(N_seq), ylim = c(0, max(ylim_r)*1.1),
+     xlab = "N", ylab = "lslx / ESEM time", main = "Runtime Ratio vs N",
+     xaxt = "n")
+axis(1, at = N_seq)
+abline(h = 1, lty = 2, col = "gray60")
+for (j in J_seq) {
+  sub <- tp_df[tp_df$J == j, ]
+  lines(sub$N, sub$ratio, type="b", pch=18,
+        col=J_cols[as.character(j)], lwd=2)
+}
+legend("topright", legend=paste0("J=",J_seq),
+       col=J_cols, lwd=2, pch=18, bty="n", cex=0.8)
+
+mtext("Turning Point Scan  |  LASSO-ESEM vs lslx",
+      outer=TRUE, cex=1.1, font=2)
+
+par(mfrow = c(1,1))
+
+
+cat("\ndataset：\n")
+print(tp_df[, c("J","N","JN_ratio","lslx_mse_mean","esem_mse_mean",
+                "lslx_time","esem_time","ratio","lslx_conv_rate")],
+      row.names=FALSE, digits=4)
+```
+```{r}
+# ============================================================
+# 细化扫描：J = 15–30，factor_corr = 0.3，50 reps
+# 每个J有自己的N范围和间隔
+# ============================================================
+set.seed(42)
+n_rep <- 50
+
+scan_grid <- list(
+  "15" = seq(50, 150, by = 20),
+  "18" = seq(60,  200, by = 20),
+  "21" = seq(120, 320, by = 20),
+  "24" = seq(100, 320, by = 20),
+  "27" = seq(130, 400, by = 30),
+  "30" = seq(100, 500, by = 50)
+)
+
+J_seq_main  <- c(15, 18, 21, 24, 27, 30)
+results_all <- list()
+
+cat("=== 扫描开始：J = 15–30，factor_corr = 0.3 ===\n\n")
+
+for (J in J_seq_main) {
+  N_vec <- scan_grid[[as.character(J)]]
+  cat("▶▶ J =", J,
+      "| N:", min(N_vec), "~", max(N_vec),
+      "| step:", unique(diff(N_vec)),
+      "| 共", length(N_vec), "个 N × 50 reps\n")
+
+  for (N in N_vec) {
+    lslx_mse_vec  <- numeric(n_rep)
+    esem_mse_vec  <- numeric(n_rep)
+    lslx_time_vec <- numeric(n_rep)
+    esem_time_vec <- numeric(n_rep)
+    lslx_conv_vec <- logical(n_rep)
+
+    for (rep in 1:n_rep) {
+      dgp <- data_generation(
+        PL = 0.6, nvar.factor = J / 3, nfactors = 3,
+        reliability = 0.36, factor_corr = 0.3,        # ← 0.3相关
+        N = N, beta = c(0.5, 0.3, 0.2),
+        VAFy = 0.5, CL = FALSE
+      )
+
+      t1 <- system.time({ r1 <- run_lslx(X = dgp$X, J = J) })
+      t2 <- system.time({ r2 <- run_approxESEM(X = dgp$X, J = J,
+                                                Lambda_true = dgp$Ptrue) })
+
+      lslx_conv_vec[rep] <- r1$converged
+      lslx_mse_vec[rep]  <- if (r1$converged) mean((r1$loadings - dgp$Ptrue)^2) else NA
+      esem_mse_vec[rep]  <- if (r2$converged) mean((r2$loadings - dgp$Ptrue)^2) else NA
+      lslx_time_vec[rep] <- t1["elapsed"]
+      esem_time_vec[rep] <- t2["elapsed"]
+    }
+
+    results_all[[paste0("J", J, "_N", N)]] <- data.frame(
+      J              = J,
+      N              = N,
+      JN_ratio       = round(J / N, 5),
+      lslx_mse_mean  = mean(lslx_mse_vec,  na.rm = TRUE),
+      lslx_mse_sd    = sd(lslx_mse_vec,    na.rm = TRUE),
+      esem_mse_mean  = mean(esem_mse_vec,  na.rm = TRUE),
+      esem_mse_sd    = sd(esem_mse_vec,    na.rm = TRUE),
+      lslx_time      = mean(lslx_time_vec),
+      esem_time      = mean(esem_time_vec),
+      lslx_conv_rate = mean(lslx_conv_vec),
+      mse_diff       = mean(esem_mse_vec,  na.rm = TRUE) -
+                       mean(lslx_mse_vec,  na.rm = TRUE)
+    )
+    cat("   N =", N,
+        "| lslx conv:", round(mean(lslx_conv_vec), 2),
+        "| lslx MSE:", round(mean(lslx_mse_vec, na.rm=TRUE), 5),
+        "| ESEM MSE:", round(mean(esem_mse_vec,  na.rm=TRUE), 5), "\n")
+  }
+  cat("   ✓ J =", J, "完成\n\n")
+}
+
+tp_df <- do.call(rbind, results_all)
+tp_df <- tp_df[order(tp_df$J, tp_df$N), ]
+rownames(tp_df) <- NULL
+cat("=== 扫描完成，共", nrow(tp_df), "行数据 ===\n")
+
+# ============================================================
+# 图1：每个J单独一张，lslx vs ESEM MSE（带SD阴影）
+# ============================================================
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 2.5, 0))
+
+for (j in J_seq_main) {
+  sub <- tp_df[tp_df$J == j, ]
+  sub <- sub[order(sub$N), ]
+  x   <- sub$N
+  N_ticks <- scan_grid[[as.character(j)]]
+
+  ylim <- range(c(sub$lslx_mse_mean + sub$lslx_mse_sd,
+                  sub$lslx_mse_mean - sub$lslx_mse_sd,
+                  sub$esem_mse_mean + sub$esem_mse_sd,
+                  sub$esem_mse_mean - sub$esem_mse_sd), na.rm = TRUE)
+  ylim[1] <- max(0, ylim[1])
+
+  plot(x, sub$lslx_mse_mean,
+       type = "b", pch = 16, col = "#E63946", lwd = 2,
+       ylim = ylim,
+       xlab = "N (sample size)", ylab = "MSE",
+       main = paste0("MSE vs N  (J=", j, ", ", n_rep, " reps)"),
+       xaxt = "n")
+  axis(1, at = pretty(x, n = 6))
+
+  # lslx SD阴影
+  polygon(c(x, rev(x)),
+          c(sub$lslx_mse_mean + sub$lslx_mse_sd,
+            rev(sub$lslx_mse_mean - sub$lslx_mse_sd)),
+          col = adjustcolor("#E63946", 0.15), border = NA)
+
+  # ESEM线 + SD阴影
+  lines(x, sub$esem_mse_mean,
+        type = "b", pch = 17, col = "#457B9D", lwd = 2, lty = 2)
+  polygon(c(x, rev(x)),
+          c(sub$esem_mse_mean + sub$esem_mse_sd,
+            rev(sub$esem_mse_mean - sub$esem_mse_sd)),
+          col = adjustcolor("#457B9D", 0.15), border = NA)
+
+  legend("topright",
+         legend = c("lslx", "LASSO-ESEM"),
+         col    = c("#E63946", "#457B9D"),
+         lwd = 2, pch = c(16, 17), lty = c(1, 2),
+         bty = "n", cex = 0.85)
+}
+
+mtext("lslx vs LASSO-ESEM  |  MSE vs N  (factor_corr = 0.3)",
+      outer = TRUE, cex = 1.1, font = 2)
+par(mfrow = c(1, 1))
+
+# ============================================================
+# 图2：MSE差值图（ESEM - lslx），每个J一张，零线 = turning point
+# ============================================================
+find_turning_point <- function(sub) {
+  for (i in 2:nrow(sub)) {
+    if (sub$mse_diff[i-1] < 0 & sub$mse_diff[i] >= 0) return(sub$N[i])
+  }
+  return(NA)
+}
+
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 2.5, 0))
+cols   <- c("#E63946","#F4A261","#2A9D8F","#457B9D","#6A4C93","#2D6A4F")
+J_cols <- setNames(cols, as.character(J_seq_main))
+
+for (j in J_seq_main) {
+  sub   <- tp_df[tp_df$J == j, ]
+  sub   <- sub[order(sub$N), ]
+  x     <- sub$N
+  y     <- sub$mse_diff
+  tp_N  <- find_turning_point(sub)
+  tp_JN <- if (!is.na(tp_N)) round(j / tp_N, 4) else NA
+
+  ylim  <- range(y, na.rm = TRUE)
+  ylim  <- ylim + c(-0.08, 0.18) * diff(ylim)
+
+  plot(x, y,
+       type = "b", pch = 16, col = J_cols[as.character(j)],
+       lwd = 2, lty = 2,
+       xlab = "N", ylab = "MSE diff (ESEM - lslx)",
+       main = paste0("J = ", j),
+       ylim = ylim, xaxt = "n")
+  axis(1, at = pretty(x, n = 6))
+  abline(h = 0, lty = 2, col = "gray50", lwd = 1.2)
+
+  if (!is.na(tp_N)) {
+    abline(v = tp_N, lty = 3, col = "gray40", lwd = 1.2)
+    text(x = tp_N, y = max(y, na.rm = TRUE),
+         labels = paste0("J/N ≈ ", tp_JN),
+         adj = c(-0.1, 1.3), cex = 0.82, col = "gray25")
+  }
+}
+
+mtext("MSE Difference (ESEM - lslx) vs N  |  Turning Point Analysis  (factor_corr = 0.3)",
+      outer = TRUE, cex = 1.0, font = 2)
+par(mfrow = c(1, 1))
+
+# ============================================================
+# Turning point 汇总表
+# ============================================================
+cat("\nTurning Point 汇总：\n")
+tp_summary <- do.call(rbind, lapply(J_seq_main, function(j) {
+  sub  <- tp_df[tp_df$J == j, ]
+  sub  <- sub[order(sub$N), ]
+  tp_N <- find_turning_point(sub)
+  data.frame(J         = j,
+             turning_N = tp_N,
+             JN_ratio  = if (!is.na(tp_N)) round(j / tp_N, 4) else NA)
+}))
+print(tp_summary, row.names = FALSE)
+```
+
+
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
