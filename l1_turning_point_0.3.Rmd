@@ -591,10 +591,9 @@ print(tp_df[, c("J","N","JN_ratio","lslx_mse_mean","esem_mse_mean",
       row.names=FALSE, digits=4)
 ```
 ```{r}
-# ============================================================
-# 细化扫描：J = 15–30，factor_corr = 0.3，50 reps
-# 每个J有自己的N范围和间隔
-# ============================================================
+
+# J = 15–30，factor_corr = 0.3，50 reps
+
 set.seed(42)
 n_rep <- 50
 
@@ -610,14 +609,14 @@ scan_grid <- list(
 J_seq_main  <- c(15, 18, 21, 24, 27, 30)
 results_all <- list()
 
-cat("=== 扫描开始：J = 15–30，factor_corr = 0.3 ===\n\n")
+cat("=== start：J = 15–30，factor_corr = 0.3 ===\n\n")
 
 for (J in J_seq_main) {
   N_vec <- scan_grid[[as.character(J)]]
   cat("▶▶ J =", J,
       "| N:", min(N_vec), "~", max(N_vec),
       "| step:", unique(diff(N_vec)),
-      "| 共", length(N_vec), "个 N × 50 reps\n")
+      "| all:", length(N_vec), "个 N × 50 reps\n")
 
   for (N in N_vec) {
     lslx_mse_vec  <- numeric(n_rep)
@@ -629,7 +628,7 @@ for (J in J_seq_main) {
     for (rep in 1:n_rep) {
       dgp <- data_generation(
         PL = 0.6, nvar.factor = J / 3, nfactors = 3,
-        reliability = 0.36, factor_corr = 0.3,        # ← 0.3相关
+        reliability = 0.36, factor_corr = 0.3,        # ← 0.3
         N = N, beta = c(0.5, 0.3, 0.2),
         VAFy = 0.5, CL = FALSE
       )
@@ -664,17 +663,17 @@ for (J in J_seq_main) {
         "| lslx MSE:", round(mean(lslx_mse_vec, na.rm=TRUE), 5),
         "| ESEM MSE:", round(mean(esem_mse_vec,  na.rm=TRUE), 5), "\n")
   }
-  cat("   ✓ J =", J, "完成\n\n")
+  cat("   ✓ J =", J, "end\n\n")
 }
 
 tp_df <- do.call(rbind, results_all)
 tp_df <- tp_df[order(tp_df$J, tp_df$N), ]
 rownames(tp_df) <- NULL
-cat("=== 扫描完成，共", nrow(tp_df), "行数据 ===\n")
+cat("=== scan bomplete，have", nrow(tp_df), "row ===\n")
 
-# ============================================================
-# 图1：每个J单独一张，lslx vs ESEM MSE（带SD阴影）
-# ============================================================
+
+# lslx vs ESEM MSE
+
 par(mfrow = c(2, 3), mar = c(4, 4, 3, 1), oma = c(0, 0, 2.5, 0))
 
 for (j in J_seq_main) {
@@ -697,13 +696,13 @@ for (j in J_seq_main) {
        xaxt = "n")
   axis(1, at = pretty(x, n = 6))
 
-  # lslx SD阴影
+  # lslx SD
   polygon(c(x, rev(x)),
           c(sub$lslx_mse_mean + sub$lslx_mse_sd,
             rev(sub$lslx_mse_mean - sub$lslx_mse_sd)),
           col = adjustcolor("#E63946", 0.15), border = NA)
 
-  # ESEM线 + SD阴影
+  # ESEM+ SD
   lines(x, sub$esem_mse_mean,
         type = "b", pch = 17, col = "#457B9D", lwd = 2, lty = 2)
   polygon(c(x, rev(x)),
@@ -722,9 +721,9 @@ mtext("lslx vs LASSO-ESEM  |  MSE vs N  (factor_corr = 0.3)",
       outer = TRUE, cex = 1.1, font = 2)
 par(mfrow = c(1, 1))
 
-# ============================================================
-# 图2：MSE差值图（ESEM - lslx），每个J一张，零线 = turning point
-# ============================================================
+
+# MSE（ESEM - lslx），0 line= turning point
+
 find_turning_point <- function(sub) {
   for (i in 2:nrow(sub)) {
     if (sub$mse_diff[i-1] < 0 & sub$mse_diff[i] >= 0) return(sub$N[i])
